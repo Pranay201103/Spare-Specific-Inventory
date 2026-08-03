@@ -7,20 +7,21 @@ from sqlalchemy import text
 # --- CONNECTION ---
 conn = st.connection("postgresql", type="sql")
 
-# --- 2. HELPERS ---
+# --- HELPERS ---
 def get_display_fields(row):
     row_dict = row.to_dict()
-    exclude = ['id', 'compatible_equipment', 'eq_type', 'qty', 'spare_type']
+    exclude = ['id', 'spare_id', 'eq_type', 'qty', 'spare_type']
     return {k.replace('_', ' ').title(): v for k, v in row_dict.items() if v and str(v) != 'nan' and k not in exclude}
 
-# --- 3. APP UI ---
+# --- APP UI CONFIG ---
 st.set_page_config(layout="wide", page_title="Inventory Management")
 if 'msg' not in st.session_state: st.session_state.msg = None
 page = st.sidebar.radio("Navigation", ["Dashboard", "Manage Inventory", "Spare Tracking"])
 
 # --- DASHBOARD PAGE ---
 if page == "Dashboard":
-    st.title("📊 Equipment & Global Spare Inventory Dashboard")
+    st.title("📊 Equipment & Shared Spare Dashboard")
+    
     all_df = conn.query("SELECT * FROM inventory", ttl=0)
     if not all_df.empty:
         c1, c2 = st.columns(2)
@@ -28,186 +29,256 @@ if page == "Dashboard":
         fig1 = px.bar(spare_qty, x='spare_type', y='qty', title="Total Qty by Spare Type", color='spare_type', text_auto=True)
         c1.plotly_chart(fig1, use_container_width=True)
         
-        eq_type_qty = all_df.groupby('eq_type')['qty'].sum().reset_index()
-        fig2 = px.pie(eq_type_qty, names='eq_type', values='qty', title="Qty by Equipment Type")
-        c2.plotly_chart(fig2, use_container_width=True)
+        # Count equipment types from equipment table
+        eq_df_count = conn.query("SELECT eq_type, COUNT(*) as count FROM equipment GROUP BY eq_type", ttl=0)
+        if not eq_df_count.empty:
+            fig2 = px.pie(eq_df_count, names='eq_type', values='count', title="Equipment Distribution")
+            c2.plotly_chart(fig2, use_container_width=True)
         
     st.divider()
-    # Search across global inventory using the compatible equipment tag field
-    search = st.text_input("🔍 Search Compatible Equipment (e.g., Pump 101):").upper().strip()
+    
+    # Search by Equipment ID (e.g., 99P05 or 99P07)
+    search = st.text_input("🔍 Search Equipment ID (e.g., 99P05):").upper().strip()
     if search:
-        df = conn.query("SELECT * FROM inventory WHERE compatible_equipment ILIKE :search", params={"search": f'%{search}%'}, ttl=0)
+        # Query utilizing the junction table to find spares linked to this equipment
+        query = """
+            SELECT i.*, e.eq_id FROM inventory i
+            JOIN equipment_spares es ON i.id = es.spare_id
+            JOIN equipment e ON e.id = es.equipment_id
+            WHERE e.eq_id ILIKE :search
+        """
+        df = conn.query(query, params={"search": f'%{search}%'}, ttl=0)
+        
         if not df.empty:
-            for spare in df['spare_type'].unique():
-                st.subheader(f"📦 {spare}s")
-                for _, row in df[df['spare_type'] == spare].iterrows():
-                    if spare == 'Mechanical spares':
-                        header = row['description'] if row.get('description') and str(row['description']) != 'nan' else "Mechanical Spare"
-                    else:
-                        header = " | ".join([str(row[c]) for c in ['subtype', 'item_detail'] if row.get(c) and str(row[c]) != 'nan']) or "Standard"
-                    with st.expander(f"📍 {header} | Total Qty: {row['qty']} | Fits: {row['compatible_equipment']}"):
-                        st.markdown(f"**Compatible Equipment:** {row['compatible_equipment']}")
+            for spare_type_group in df['spare_type'].unique():
+                st.subheader(f"📦 {spare_type_group}s for {search}")
+                for _, row in df[df['spare_type'] == spare_type_group].iterrows():
+                    
+                    # Fetch ALL other equipment sharing this exact same spare_id
+                    shared_query = """
+                        e.eq_id FROM equipment e
+                        JOIN equipment_spares es ON e.id = es.equipment_id
+                        WHERE es.spare_id = :sid
+                    """
+                    shared_eqs_df = conn.query(f"SELECT {shared_query}", params={"sid": row['id']}, ttl=0)
+                    shared_list = ", ".join(shared_eqs_df['eq_id'].tolist()) if not shared_eqs_df['eq_id'].empty else row['eq_id']
+                    
+                    header = row['spare_id'] if row.get('spare_id') else "Spare Part"
+                    with st.expander(f"📍 ID: {header} | Qty: {row['qty']} | Shared Across: [{shared_list}]"):
+                        st.markdown(f"**🔗 Shared with Equipment:** `{shared_list}`")
                         for k, v in get_display_fields(row).items(): 
-                            st.markdown(f"**{k}:** {v}")
+                            if k != 'Eq Id':
+                                st.markdown(f"**{k}:** {v}")
         else:
-            st.warning("No spare parts found for this equipment.")
+            st.warning("No spares found for this equipment ID.")
     else:
-        st.caption("👈 Search equipment tags above to view compatible parts and stock levels.")
+        st.caption("👈 Search an equipment ID above to view its components and discover shared parts.")
 
 # --- MANAGE INVENTORY ---
 elif page == "Manage Inventory":
-    st.title("➕ Manage Universal Inventory")
+    st.title("➕ Manage Inventory & Links")
     if st.session_state.msg: 
         st.success(st.session_state.msg)
         st.session_state.msg = None
         
-    tab1, tab2 = st.tabs(["➕ Add New Universal Spare", "🔄 Update Quantity"])
+    tab1, tab2, tab3 = st.tabs(["➕ Add New Spare", "⚙️ Register Equipment", "🔄 Update Quantity"])
     
     with tab1:
-        # Changed from single equipment ID to comma-separated compatible equipment tags
-        compatible_equipment = st.text_input("Compatible Equipment IDs (comma-separated):", key="add_compat", placeholder="Pump-101, Pump-102, Compressor-A").upper().strip()
-        eq_type = st.selectbox("Primary Equipment Type:", ["Pump", "Compressor", "AFC", "Fan"], key="add_eq")
-        options = {"Pump": ["Seal", "Bearing", "Mechanical spares"],
-                   "Compressor": ["Valve", "Bearing", "Mechanical spares"],
-                   "AFC": ["Belt", "Pulley", "Bearing", "Mechanical spares"]}
-        spare_type = st.selectbox("Spare Type:", options.get(eq_type, ["Bearing", "Mechanical spares"]), key="add_spare")
+        st.subheader("Add Universal Spare & Link Equipment")
         
-        subtype, cat, origin, vendor, ref_date, item_detail, bearing_no, description, pulley_type, pulley_desc, seal_oem, valve_oem = [None] * 12
-        
-        if eq_type == "Pump" and spare_type == "Seal":
-            subtype = st.selectbox("Sub-type:", ["Cartridge seal", "Seal spare"], key="add_sub")
-            if subtype == "Seal spare":
-                cat = st.selectbox("Category:", ["Faces", "Packings"], key="add_cat")
-                item_detail = st.text_input(f"Enter {cat} details:", key="add_det")
-            seal_oem = st.text_input("Seal OEM:", key="add_oem")
-            origin = st.selectbox("Origin:", ["OEM", "Locally made", "Locally refurbished"], key="add_orig")
-        elif eq_type == "Compressor" and spare_type == "Valve":
-            subtype = st.selectbox("Valve Type:", ["Suction valve", "Discharge valve"], key="add_sub")
-            origin = st.selectbox("Condition:", ["New", "Refurbished"], key="add_orig")
-            if origin == "New":
-                valve_oem = st.text_input("Valve OEM:", key="add_v_oem")
-            else:
+        # 1. Fetch available equipment to link
+        eq_list_df = conn.query("SELECT id, eq_id FROM equipment", ttl=0)
+        if eq_list_df.empty:
+            st.warning("⚠️ Please register equipment in the 'Register Equipment' tab first before adding spares!")
+        else:
+            # Create selection dictionary mapping eq_id to database id
+            eq_options = {row['eq_id']: row['id'] for _, row in eq_list_df.iterrows()}
+            selected_eqs = st.multiselect("Select Compatible Equipment:", options=list(eq_options.keys()))
+            
+            eq_type = st.selectbox("Primary Equipment Type:", ["Pump", "Compressor", "AFC", "Fan"], key="add_eq")
+            options = {"Pump": ["Seal", "Bearing", "Mechanical spares"],
+                       "Compressor": ["Valve", "Bearing", "Mechanical spares"],
+                       "AFC": ["Belt", "Pulley", "Bearing", "Mechanical spares"]}
+            spare_type = st.selectbox("Spare Type:", options.get(eq_type, ["Bearing", "Mechanical spares"]), key="add_spare")
+            
+            subtype, cat, origin, vendor, ref_date, item_detail, bearing_no, description, pulley_type, pulley_desc, seal_oem, valve_oem = [None] * 12
+            
+            if eq_type == "Pump" and spare_type == "Seal":
+                subtype = st.selectbox("Sub-type:", ["Cartridge seal", "Seal spare"], key="add_sub")
+                if subtype == "Seal spare":
+                    cat = st.selectbox("Category:", ["Faces", "Packings"], key="add_cat")
+                    item_detail = st.text_input(f"Enter {cat} details:", key="add_det")
+                seal_oem = st.text_input("Seal OEM:", key="add_oem")
+                origin = st.selectbox("Origin:", ["OEM", "Locally made", "Locally refurbished"], key="add_orig")
+            elif eq_type == "Compressor" and spare_type == "Valve":
+                subtype = st.selectbox("Valve Type:", ["Suction valve", "Discharge valve"], key="add_sub")
+                origin = st.selectbox("Condition:", ["New", "Refurbished"], key="add_orig")
+                if origin == "New":
+                    valve_oem = st.text_input("Valve OEM:", key="add_v_oem")
+                else:
+                    vendor = st.text_input("Vendor Name:", key="add_ven")
+                    ref_date = st.date_input("Refurbishment Date:", key="add_date").strftime("%Y-%m-%d")
+            elif spare_type == "Bearing":
+                bearing_no = st.text_input("Enter Bearing Number:", key="add_bear")
+                origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
+            elif spare_type == "Mechanical spares":
+                description = st.text_input("Enter Description:", key="add_desc")
+                origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
+            elif eq_type == "AFC" and spare_type == "Pulley":
+                pulley_type = st.selectbox("Pulley Type:", ["Motor pulley", "Fan pulley"], key="add_p_type")
+                pulley_desc = st.text_input("Enter Pulley Description:", key="add_p_desc")
+                origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
+                
+            if origin and origin != "OEM" and spare_type != "Valve":
                 vendor = st.text_input("Vendor Name:", key="add_ven")
-                ref_date = st.date_input("Refurbishment Date:", key="add_date").strftime("%Y-%m-%d")
-        elif spare_type == "Bearing":
-            bearing_no = st.text_input("Enter Bearing Number:", key="add_bear")
-            origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
-        elif spare_type == "Mechanical spares":
-            description = st.text_input("Enter Description:", key="add_desc")
-            origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
-        elif eq_type == "AFC" and spare_type == "Pulley":
-            pulley_type = st.selectbox("Pulley Type:", ["Motor pulley", "Fan pulley"], key="add_p_type")
-            pulley_desc = st.text_input("Enter Pulley Description:", key="add_p_desc")
-            origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
+                ref_date = st.date_input("Date:", key="add_date").strftime("%Y-%m-%d")
+                
+            qty = st.number_input("Warehouse Quantity:", min_value=0, key="add_qty")
+            loc = st.text_input("Storage Location:", key="add_loc")
             
-        if origin and origin != "OEM" and spare_type != "Valve":
-            vendor = st.text_input("Vendor Name:", key="add_ven")
-            ref_date = st.date_input("Date:", key="add_date").strftime("%Y-%m-%d")
-            
-        qty = st.number_input("Total Global Warehouse Quantity:", min_value=0, key="add_qty")
-        loc = st.text_input("Storage Location:", key="add_loc")
+            if st.button("Save Spare & Link"):
+                if not selected_eqs:
+                    st.error("You must select at least one compatible equipment item!")
+                else:
+                    try:
+                        with conn.session as s:
+                            # Generate Unique Spare ID (e.g. BEAR-001)
+                            count_res = s.execute(text("SELECT COUNT(*) FROM inventory")).fetchone()
+                            next_num = (count_res[0] if count_res else 0) + 1
+                            prefix = spare_type[:4].upper().replace(" ", "")
+                            generated_spare_id = f"{prefix}-{next_num:03d}"
+                            
+                            # Insert Spare into Inventory Table
+                            res = s.execute(text("""
+                                INSERT INTO inventory (spare_id, spare_type, subtype, category, item_detail, origin, vendor, ref_date, qty, storage_loc, bearing_no, description, pulley_type, pulley_desc, seal_oem, valve_oem) 
+                                VALUES (:sid, :st, :sub, :cat, :det, :ori, :ven, :ref, :qty, :loc, :bn, :desc, :pt, :pd, :soem, :voem)
+                                RETURNING id
+                            """), {
+                                "sid": generated_spare_id, "st": spare_type, "sub": subtype, "cat": cat, 
+                                "det": item_detail, "ori": origin, "ven": vendor, "ref": ref_date, 
+                                "qty": qty, "loc": loc, "bn": bearing_no, "desc": description, 
+                                "pt": pulley_type, "pd": pulley_desc, "soem": seal_oem, "voem": valve_oem
+                            })
+                            spare_pk_id = res.fetchone()[0]
+                            
+                            # Link to Multiple Equipment via Junction Table
+                            for eq_name in selected_eqs:
+                                eq_pk_id = eq_options[eq_name]
+                                s.execute(text("""
+                                    INSERT INTO equipment_spares (equipment_id, spare_id) 
+                                    VALUES (:eq_id, :sp_id)
+                                    ON CONFLICT DO NOTHING
+                                """), {"eq_id": eq_pk_id, "sp_id": spare_pk_id})
+                                
+                            s.commit()
+                        
+                        st.session_state.msg = f"Successfully added spare ID **{generated_spare_id}** and linked to {len(selected_eqs)} equipment entries!"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error saving entry: {e}")
+
+    with tab2:
+        st.subheader("Register Machinery/Equipment First")
+        new_eq_id = st.text_input("Equipment ID (e.g., 99P05, 99P07):", key="reg_eq_id").upper().strip()
+        new_eq_type = st.selectbox("Equipment Type:", ["Pump", "Compressor", "AFC", "Fan"], key="reg_eq_type")
         
-        if st.button("Save Universal Spare"):
-            if not compatible_equipment:
-                st.error("Compatible Equipment is mandatory!")
+        if st.button("Register Equipment"):
+            if not new_eq_id:
+                st.error("Equipment ID cannot be empty.")
             else:
                 try:
                     with conn.session as s:
                         s.execute(text("""
-                            INSERT INTO inventory (compatible_equipment, eq_type, spare_type, subtype, category, item_detail, origin, vendor, ref_date, qty, storage_loc, bearing_no, description, pulley_type, pulley_desc, seal_oem, valve_oem) 
-                            VALUES (:compat, :et, :st, :sub, :cat, :det, :ori, :ven, :ref, :qty, :loc, :bn, :desc, :pt, :pd, :soem, :voem)
-                        """), {
-                            "compat": compatible_equipment, "et": eq_type, "st": spare_type, "sub": subtype, "cat": cat, 
-                            "det": item_detail, "ori": origin, "ven": vendor, "ref": ref_date, 
-                            "qty": qty, "loc": loc, "bn": bearing_no, "desc": description, 
-                            "pt": pulley_type, "pd": pulley_desc, "soem": seal_oem, "voem": valve_oem
-                        })
+                            INSERT INTO equipment (eq_id, eq_type) VALUES (:eid, :etype)
+                            ON CONFLICT (eq_id) DO NOTHING
+                        """), {"eid": new_eq_id, "etype": new_eq_type})
                         s.commit()
-                    
-                    st.session_state.msg = "Universal spare added successfully!"
+                    st.success(f"Equipment **{new_eq_id}** registered successfully!")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error saving entry: {e}")
-      
-    with tab2:
-        # Load unique entries or search for items to update quantity
-        search_query = st.text_input("Filter inventory items by spare or tag:", "").upper().strip()
-        query_str = "SELECT * FROM inventory"
-        if search_query:
-            query_str += f" WHERE spare_type ILIKE '%{search_query}%' OR compatible_equipment ILIKE '%{search_query}%'"
-        
-        inv_df = conn.query(query_str, ttl=0)
-        if not inv_df.empty:
-            with st.form("update_form"):
-                u_data = {}
-                u_desc = {}
-                for _, r in inv_df.iterrows():
-                    with st.container(border=True):
-                        details = get_display_fields(r)
-                        desc_str = f"{r['spare_type']} (Fits: {r['compatible_equipment']}) | " + " | ".join([f"{k}: {v}" for k, v in details.items()])
-                        u_desc[r['id']] = desc_str
+                    st.error(f"Error registering equipment: {e}")
 
-                        st.write(f"### {r['spare_type']} — *Fits: {r['compatible_equipment']}*")
-                        cols = st.columns(3)
-                        idx = 0
-                        for k, v in details.items():
-                            cols[idx % 3].write(f"**{k}:** {v}")
-                            idx += 1
-                        st.write(f"**Location:** {r.get('storage_loc', 'N/A')}")
-                        st.write("---")
-                        
-                        c1, c2, c3 = st.columns(3)
-                        new_q = c1.number_input(f"New Global Qty", value=int(r['qty']), key=f"q_{r['id']}")
-                        # Require the user to type the *specific* machine this part is being withdrawn for
-                        target_machine = c2.text_input(f"Installed On (Equipment)", key=f"m_{r['id']}", placeholder="e.g. Pump-101")
-                        rsn = c3.text_input(f"Reason", key=f"r_{r['id']}")
-                        
-                        u_data[r['id']] = (new_q, rsn, target_machine, r['qty'], r['compatible_equipment'])
+    with tab3:
+        st.subheader("Update Stock and Log Maintenance")
+        eq_dropdown_df = conn.query("SELECT eq_id FROM equipment", ttl=0)
+        if not eq_dropdown_df.empty:
+            selected_update_eq = st.selectbox("Select Equipment ID to manage spares:", [""] + list(eq_dropdown_df['eq_id'].unique()))
+            if selected_update_eq:
+                # Query inventory linked to this specific equipment
+                eq_inv_query = """
+                    SELECT i.* FROM inventory i
+                    JOIN equipment_spares es ON i.id = es.spare_id
+                    JOIN equipment e ON e.id = es.equipment_id
+                    WHERE e.eq_id = :eq
+                """
+                eq_df = conn.query(eq_inv_query, params={"eq": selected_update_eq}, ttl=0)
+                if not eq_df.empty:
+                    with st.form("update_form"):
+                        u_data = {}
+                        u_desc = {}
+                        for _, r in eq_df.iterrows():
+                            with st.container(border=True):
+                                details = get_display_fields(r)
+                                desc_str = f"[{r['spare_id']}] {r['spare_type']} | " + " | ".join([f"{k}: {v}" for k, v in details.items()])
+                                u_desc[r['id']] = desc_str
 
-                if st.form_submit_button("Save Updates & Log"):
-                    updated_count = 0
-                    with conn.session as s:
-                        for id, (q, rsn, target_machine, old_q, compat) in u_data.items():
-                            if int(q) != int(old_q):
-                                s.execute(text("UPDATE inventory SET qty = :q WHERE id = :id"), {"q": q, "id": id})
-                                detailed_spare_info = u_desc[id]
+                                st.write(f"### ID: `{r['spare_id']}` — {r['spare_type']}")
+                                cols = st.columns(3)
+                                idx = 0
+                                for k, v in details.items():
+                                    cols[idx % 3].write(f"**{k}:** {v}")
+                                    idx += 1
+                                st.write(f"**Location:** {r.get('storage_loc', 'N/A')}")
+                                st.write("---")
                                 
-                                log_equipment = target_machine if target_machine else compat
-                                s.execute(text("""
-                                    INSERT INTO logs (date, equipment, spare, change, old_qty, new_qty, reason) 
-                                    VALUES (NOW(), :eq, :sp, 'UPDATE', :o, :n, :rsn)
-                                """), {
-                                    "eq": log_equipment, "sp": detailed_spare_info, "o": old_q, "n": q, "rsn": rsn
-                                })
-                                updated_count += 1
-                        s.commit()
-                    if updated_count > 0:
-                        st.session_state.msg = f"Successfully updated {updated_count} item(s) and logged changes!"
-                    else:
-                        st.session_state.msg = "No quantity changes were detected."
-                    st.rerun()
-        else:
-            st.info("No inventory records found.")
+                                c1, c2 = st.columns(2)
+                                new_q = c1.number_input(f"New Global Warehouse Qty", value=int(r['qty']), key=f"q_{r['id']}")
+                                rsn = c2.text_input(f"Maintenance Reason", key=f"r_{r['id']}")
+                                
+                                u_data[r['id']] = (new_q, rsn, r['qty'])
+
+                        if st.form_submit_button("Save Stock Updates & Log"):
+                            updated_count = 0
+                            with conn.session as s:
+                                for id, (q, rsn, old_q) in u_data.items():
+                                    if int(q) != int(old_q):
+                                        s.execute(text("UPDATE inventory SET qty = :q WHERE id = :id"), {"q": q, "id": id})
+                                        detailed_spare_info = u_desc[id]
+                                        
+                                        s.execute(text("""
+                                            INSERT INTO logs (date, equipment, spare, change, old_qty, new_qty, reason) 
+                                            VALUES (NOW(), :eq, :sp, 'UPDATE', :o, :n, :rsn)
+                                        """), {
+                                            "eq": selected_update_eq, "sp": detailed_spare_info, "o": old_q, "n": q, "rsn": rsn
+                                        })
+                                        updated_count += 1
+                                s.commit()
+                            if updated_count > 0:
+                                st.session_state.msg = f"Successfully updated {updated_count} item(s)!"
+                            else:
+                                st.session_state.msg = "No quantity changes detected."
+                            st.rerun()
+                else:
+                    st.info("No parts are currently linked to this equipment.")
 
 elif page == "Spare Tracking":
-    st.title("📊 Activity Dashboard & Log History")
+    st.title("📊 Activity History Stream")
     log_df = conn.query("SELECT * FROM logs", ttl=0)
     if not log_df.empty:
         all_eqs = sorted(log_df['equipment'].dropna().unique())
-        sel_eqs = st.multiselect("Filter by Equipment/Tag:", all_eqs)
+        sel_eqs = st.multiselect("Filter by Equipment ID:", all_eqs)
         if sel_eqs:
             log_df = log_df[log_df['equipment'].isin(sel_eqs)]
         log_df = log_df.sort_values(by='date', ascending=False)
-        st.subheader("Recent Activity Stream")
-        for _, row in log_df.head(15).iterrows():
+        for _, row in log_df.head(20).iterrows():
             with st.container(border=True):
                 col1, col2, col3 = st.columns([1, 2, 1])
                 col1.caption(str(row['date']))
-                col1.metric("Target Equipment", str(row['equipment']))
-                col2.write("**Item Details**")
+                col1.metric("Equipment", str(row['equipment']))
+                col2.write("**Spare Component Details**")
                 col2.write(str(row['spare']))
                 diff = int(row['new_qty']) - int(row['old_qty'])
                 col3.metric("Change", f"{diff:+d}", delta_color="normal")
                 col3.write(f"Reason: {row['reason']}")
     else:
-        st.info("No activity logs to display yet.")
+        st.info("No logs recorded yet.")
