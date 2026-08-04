@@ -97,7 +97,7 @@ elif page == "Manage Inventory":
             
             eq_type = st.selectbox("Primary Equipment Type:", ["Pump", "Compressor", "AFC", "Fan"], key="add_eq")
             options = {"Pump": ["Seal", "Bearing", "Mechanical spares"],
-                       "Compressor": ["Valve", "Bearing", "Mechanical spares"],
+                       "Compressor": ["Seal","Valve", "Bearing", "Mechanical spares"],
                        "AFC": ["Belt", "Pulley", "Bearing", "Mechanical spares"]}
             spare_type = st.selectbox("Spare Type:", options.get(eq_type, ["Bearing", "Mechanical spares"]), key="add_spare")
             
@@ -118,6 +118,13 @@ elif page == "Manage Inventory":
                 else:
                     vendor = st.text_input("Vendor Name:", key="add_ven")
                     ref_date = st.date_input("Refurbishment Date:", key="add_date").strftime("%Y-%m-%d")
+            elif eq_type == "Compressor" and spare_type == "Seal":
+                subtype = st.selectbox("Sub-type:", ["Cartridge seal", "Seal spare"], key="add_sub")
+                if subtype == "Seal spare":
+                    cat = st.selectbox("Category:", ["Faces", "Packings"], key="add_cat")
+                    item_detail = st.text_input(f"Enter {cat} details:", key="add_det")
+                seal_oem = st.text_input("Seal OEM:", key="add_oem")
+                origin = st.selectbox("Origin:", ["OEM", "Locally made", "Locally refurbished"], key="add_orig")
             elif spare_type == "Bearing":
                 bearing_no = st.text_input("Enter Bearing Number:", key="add_bear")
                 origin = st.selectbox("Origin:", ["OEM", "Locally made"], key="add_orig")
