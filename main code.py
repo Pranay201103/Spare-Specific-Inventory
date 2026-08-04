@@ -81,7 +81,7 @@ elif page == "Manage Inventory":
         st.success(st.session_state.msg)
         st.session_state.msg = None
         
-    tab1, tab2, tab3 = st.tabs(["➕ Add New Spare", "⚙️ Register Equipment", "🔄 Update Quantity"])
+    tab1, tab2, tab3, tab4 = st.tabs(["➕ Add New Spare", "⚙️ Register Equipment", "🔗 Link Existing Spare", "🔄 Update Quantity"])
     
     with tab1:
         st.subheader("Add Universal Spare & Link Equipment")
@@ -197,8 +197,44 @@ elif page == "Manage Inventory":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error registering equipment: {e}")
-
     with tab3:
+        st.subheader("Link an Existing Spare to Another Equipment")
+        
+        # 1. Fetch all spares
+        spares_df = conn.query("SELECT id, spare_id, spare_type, description, bearing_no, seal_oem FROM inventory", ttl=0)
+        # 2. Fetch all equipment
+        eq_df = conn.query("SELECT id, eq_id FROM equipment", ttl=0)
+        
+        if spares_df.empty or eq_df.empty:
+            st.info("You need both registered equipment and spare parts to create a link.")
+        else:
+            # Create a nice label for the spare dropdown
+            spares_df['label'] = spares_df['spare_id'] + " - " + spares_df['spare_type']
+            spare_options = {row['label']: row['id'] for _, row in spares_df.iterrows()}
+            eq_options = {row['eq_id']: row['id'] for _, row in eq_df.iterrows()}
+            
+            selected_spare_label = st.selectbox("Select Spare Part:", list(spare_options.keys()))
+            selected_equipment_id = st.selectbox("Select Equipment to Link:", list(eq_options.keys()))
+            
+            if st.button("Create Link"):
+                chosen_spare_pk = spare_options[selected_spare_label]
+                chosen_eq_pk = eq_options[selected_equipment_id]
+                
+                try:
+                    with conn.session as s:
+                        # Insert into the junction table
+                        s.execute(text("""
+                            INSERT INTO equipment_spares (equipment_id, spare_id) 
+                            VALUES (:eq_id, :sp_id)
+                            ON CONFLICT DO NOTHING
+                        """), {"eq_id": chosen_eq_pk, "sp_id": chosen_spare_pk})
+                        s.commit()
+                    st.success(f"Successfully linked **{selected_spare_label}** to equipment **{selected_equipment_id}**!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error creating link: {e}")
+
+    with tab4:
         st.subheader("Update Stock and Log Maintenance")
         eq_dropdown_df = conn.query("SELECT eq_id FROM equipment", ttl=0)
         if not eq_dropdown_df.empty:
