@@ -16,7 +16,7 @@ def get_display_fields(row):
 # --- APP UI CONFIG ---
 st.set_page_config(layout="wide", page_title="Inventory Management")
 if 'msg' not in st.session_state: st.session_state.msg = None
-page = st.sidebar.radio("Navigation", ["Dashboard", "Manage Inventory", "Spare Tracking"])
+page = st.sidebar.radio("Navigation", ["Dashboard", "Manage Inventory", "Spare-Equipment Mapping", "Spare Tracking"])
 
 # --- DASHBOARD PAGE ---
 if page == "Dashboard":
@@ -318,3 +318,58 @@ elif page == "Spare Tracking":
                 col3.write(f"Reason: {row['reason']}")
     else:
         st.info("No logs recorded yet.")
+
+elif page == "Spare-Equipment Mapping":
+    st.title("🔗 Spare & Equipment Relationship Mapping")
+    st.caption("View a complete overview of which spare parts are linked to which equipment items.")
+    
+    # Query to fetch all spares and all their linked equipment cleanly using joins
+    mapping_query = """
+        SELECT 
+            i.spare_id, 
+            i.spare_type, 
+            i.qty as warehouse_qty,
+            i.storage_loc,
+            COALESCE(string_agg(e.eq_id, ', ' ORDER BY e.eq_id), 'No Equipment Linked') as linked_equipment
+        FROM inventory i
+        LEFT JOIN equipment_spares es ON i.id = es.spare_id
+        LEFT JOIN equipment e ON e.id = es.equipment_id
+        GROUP BY i.id, i.spare_id, i.spare_type, i.qty, i.storage_loc
+        ORDER BY i.spare_id;
+    """
+    
+    mapping_df = conn.query(mapping_query, ttl=0)
+    
+    if not mapping_df.empty:
+        # Optional search/filter bar to find a specific spare or equipment quickly
+        search_filter = st.text_input("🔍 Filter by Spare ID, Type, or Equipment:").upper().strip()
+        
+        if search_filter:
+            # Filter rows where search term appears in spare_id, spare_type, or linked_equipment
+            filtered_df = mapping_df[
+                mapping_df['spare_id'].str.upper().str.contains(search_filter, na=False) |
+                mapping_df['spare_type'].str.upper().str.contains(search_filter, na=False) |
+                mapping_df['linked_equipment'].str.upper().str.contains(search_filter, na=False)
+            ]
+        else:
+            filtered_df = mapping_df
+            
+        if not filtered_df.empty:
+            # Display using an interactive, clean dataframe table
+            st.dataframe(
+                filtered_df[['spare_id', 'spare_type', 'warehouse_qty', 'storage_loc', 'linked_equipment']],
+                column_config={
+                    "spare_id": "Spare ID",
+                    "spare_type": "Spare Type",
+                    "warehouse_qty": "Warehouse Qty",
+                    "storage_loc": "Storage Location",
+                    "linked_equipment": "Linked Equipment IDs"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            st.info(f"Showing {len(filtered_df)} mapping record(s).")
+        else:
+            st.warning("No matching records found for your filter.")
+    else:
+        st.info("No inventory or equipment links found in the database yet.")
