@@ -328,11 +328,12 @@ elif page == "Spare Tracking":
 
 elif page == "Spare-Equipment Mapping":
     st.title("🔗 Spare & Equipment Relationship Mapping")
-    st.caption("View a complete overview of which spare parts are linked to which equipment items.")
+    st.caption("View or manage links between spare parts and equipment items.")
     
-    # Query to fetch all spares and all their linked equipment cleanly using joins
+    # 1. Main Table Display (Same as before)
     mapping_query = """
         SELECT 
+            i.id as spare_pk,
             i.spare_id, 
             i.spare_type, 
             i.qty as warehouse_qty,
@@ -348,11 +349,9 @@ elif page == "Spare-Equipment Mapping":
     mapping_df = conn.query(mapping_query, ttl=0)
     
     if not mapping_df.empty:
-        # Optional search/filter bar to find a specific spare or equipment quickly
         search_filter = st.text_input("🔍 Filter by Spare ID, Type, or Equipment:").upper().strip()
         
         if search_filter:
-            # Filter rows where search term appears in spare_id, spare_type, or linked_equipment
             filtered_df = mapping_df[
                 mapping_df['spare_id'].str.upper().str.contains(search_filter, na=False) |
                 mapping_df['spare_type'].str.upper().str.contains(search_filter, na=False) |
@@ -362,7 +361,6 @@ elif page == "Spare-Equipment Mapping":
             filtered_df = mapping_df
             
         if not filtered_df.empty:
-            # Display using an interactive, clean dataframe table
             st.dataframe(
                 filtered_df[['spare_id', 'spare_type', 'warehouse_qty', 'storage_loc', 'linked_equipment']],
                 column_config={
@@ -375,8 +373,47 @@ elif page == "Spare-Equipment Mapping":
                 hide_index=True,
                 use_container_width=True
             )
-            st.info(f"Showing {len(filtered_df)} mapping record(s).")
         else:
             st.warning("No matching records found for your filter.")
+            
+        st.divider()
+        
+        # 2. Unlinking Section
+        st.subheader("🗑️ Unlink Equipment from a Spare")
+        st.caption("Select a spare part to view its current individual links and safely remove any incorrect associations.")
+        
+        # Dropdown to select a specific spare
+        spare_options = {f"{row['spare_id']} ({row['spare_type']})": row['spare_pk'] for _, row in mapping_df.iterrows()}
+        selected_spare_label = st.selectbox("Select Spare Part to Modify Links:", list(spare_options.keys()))
+        selected_spare_pk = spare_options[selected_spare_label]
+        
+        # Fetch individual equipment currently linked to this specific spare
+        linked_eq_query = """
+            e.id as eq_pk, e.eq_id FROM equipment e
+            JOIN equipment_spares es ON e.id = es.equipment_id
+            WHERE es.spare_id = :spare_id
+        """
+        current_links_df = conn.query(f"SELECT {linked_eq_query}", params={"spare_id": selected_spare_pk}, ttl=0)
+        
+        if not current_links_df.empty:
+            eq_link_options = {row['eq_id']: row['eq_pk'] for _, row in current_links_df.iterrows()}
+            selected_eq_to_unlink = st.selectbox("Select Equipment to Remove Link:", list(eq_link_options.keys()))
+            
+            if st.button("❌ Remove Link"):
+                target_eq_pk = eq_link_options[selected_eq_to_unlink]
+                try:
+                    with conn.session as s:
+                        s.execute(text("""
+                            DELETE FROM equipment_spares 
+                            WHERE spare_id = :spare_id AND equipment_id = :eq_id
+                        """), {"spare_id": selected_spare_pk, "eq_id": target_eq_pk})
+                        s.commit()
+                    st.success(f"Successfully unlinked equipment **{selected_eq_to_unlink}** from spare **{selected_spare_label}**!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error removing link: {e}")
+        else:
+            st.info("This spare part has no equipment currently linked to it.")
+            
     else:
-        st.info("No inventory or equipment links found in the database yet.")
+        st.info("No inventory records found.")
