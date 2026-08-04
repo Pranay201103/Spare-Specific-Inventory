@@ -81,7 +81,7 @@ elif page == "Manage Inventory":
         st.success(st.session_state.msg)
         st.session_state.msg = None
         
-    tab1, tab2, tab3, tab4 = st.tabs(["➕ Add New Spare", "⚙️ Register Equipment", "🔗 Link Existing Spare", "🔄 Update Quantity"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["➕ Add New Spare", "⚙️ Register Equipment", "🔗 Link Existing Spare", "🔄 Update Quantity","✏️ Edit Spare Details"])
     
     with tab1:
         st.subheader("Add Universal Spare & Link Equipment")
@@ -303,6 +303,65 @@ elif page == "Manage Inventory":
                             st.rerun()
                 else:
                     st.info("No parts are currently linked to this equipment.")
+    with tab5:
+        st.subheader("Edit Existing Spare Details")
+        
+        # Fetch all available spares to select from
+        spares_df = conn.query("SELECT * FROM inventory ORDER BY spare_id", ttl=0)
+        
+        if spares_df.empty:
+            st.info("No spare parts available to edit.")
+        else:
+            # Create a clean selection label
+            spares_df['edit_label'] = spares_df['spare_id'] + " (" + spares_df['spare_type'] + ")"
+            edit_options = {row['edit_label']: row['id'] for _, row in spares_df.iterrows()}
+            
+            selected_edit_label = st.selectbox("Select Spare Part to Edit:", list(edit_options.keys()), key="edit_spare_select")
+            selected_spare_id_pk = edit_options[selected_edit_label]
+            
+            # Fetch the specific row data for the selected spare
+            spare_row = spares_df[spares_df['id'] == selected_spare_id_pk].iloc[0]
+            
+            with st.form("edit_spare_form"):
+                st.write(f"Editing details for: **{spare_row['spare_id']}**")
+                
+                # Allow editing general editable metadata fields
+                new_storage_loc = st.text_input("Storage Location", value=str(spare_row.get('storage_loc', '') if str(spare_row.get('storage_loc')) != 'nan' else ''))
+                new_origin = st.selectbox("Origin", ["OEM", "Locally made", "Locally refurbished"], 
+                                          index=["OEM", "Locally made", "Locally refurbished"].index(spare_row['origin']) if spare_row.get('origin') in ["OEM", "Locally made", "Locally refurbished"] else 0)
+                new_vendor = st.text_input("Vendor Name", value=str(spare_row.get('vendor', '') if str(spare_row.get('vendor')) != 'nan' else ''))
+                
+                # Conditional fields based on spare type / details
+                new_item_detail = spare_row.get('item_detail')
+                if spare_row.get('spare_type') == 'Seal':
+                    new_item_detail = st.text_input("Item Detail / Category info", value=str(spare_row.get('item_detail', '') if str(spare_row.get('item_detail')) != 'nan' else ''))
+                
+                new_description = spare_row.get('description')
+                if spare_row.get('spare_type') == 'Mechanical spares':
+                    new_description = st.text_input("Description", value=str(spare_row.get('description', '') if str(spare_row.get('description')) != 'nan' else ''))
+
+                submitted_edits = st.form_submit_button("Save Changes")
+                
+                if submitted_edits:
+                    try:
+                        with conn.session as s:
+                            s.execute(text("""
+                                UPDATE inventory 
+                                SET storage_loc = :loc, origin = :ori, vendor = :ven, item_detail = :det, description = :desc
+                                WHERE id = :id
+                            """), {
+                                "loc": new_storage_loc,
+                                "ori": new_origin,
+                                "ven": new_vendor,
+                                "det": new_item_detail,
+                                "desc": new_description,
+                                "id": selected_spare_id_pk
+                            })
+                            s.commit()
+                        st.session_state.msg = f"Successfully updated details for {spare_row['spare_id']}!"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error updating spare details: {e}")
 
 elif page == "Spare Tracking":
     st.title("📊 Activity History Stream")
