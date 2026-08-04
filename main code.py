@@ -306,14 +306,24 @@ elif page == "Manage Inventory":
     with tab5:
         st.subheader("Edit Existing Spare Details")
         
-        # Fetch all available spares to select from
-        spares_df = conn.query("SELECT * FROM inventory ORDER BY spare_id", ttl=0)
+        # Query spares along with their aggregated linked equipment names
+        edit_query = """
+            SELECT 
+                i.*, 
+                COALESCE(string_agg(e.eq_id, ', ' ORDER BY e.eq_id), 'None') as linked_eqs
+            FROM inventory i
+            LEFT JOIN equipment_spares es ON i.id = es.spare_id
+            LEFT JOIN equipment e ON e.id = es.equipment_id
+            GROUP BY i.id
+            ORDER BY i.spare_id;
+        """
+        spares_df = conn.query(edit_query, ttl=0)
         
         if spares_df.empty:
             st.info("No spare parts available to edit.")
         else:
-            # Create a clean selection label
-            spares_df['edit_label'] = spares_df['spare_id'] + " (" + spares_df['spare_type'] + ")"
+            # Create a descriptive label containing the spare ID, type, AND associated equipment
+            spares_df['edit_label'] = spares_df['spare_id'] + " (" + spares_df['spare_type'] + ") — Fits: " + spares_df['linked_eqs']
             edit_options = {row['edit_label']: row['id'] for _, row in spares_df.iterrows()}
             
             selected_edit_label = st.selectbox("Select Spare Part to Edit:", list(edit_options.keys()), key="edit_spare_select")
@@ -323,15 +333,19 @@ elif page == "Manage Inventory":
             spare_row = spares_df[spares_df['id'] == selected_spare_id_pk].iloc[0]
             
             with st.form("edit_spare_form"):
-                st.write(f"Editing details for: **{spare_row['spare_id']}**")
+                st.write(f"Editing details for: **{spare_row['spare_id']}** *(Linked Equipment: {spare_row['linked_eqs']})*")
                 
                 # Allow editing general editable metadata fields
                 new_storage_loc = st.text_input("Storage Location", value=str(spare_row.get('storage_loc', '') if str(spare_row.get('storage_loc')) != 'nan' else ''))
-                new_origin = st.selectbox("Origin", ["OEM", "Locally made", "Locally refurbished"], 
-                                          index=["OEM", "Locally made", "Locally refurbished"].index(spare_row['origin']) if spare_row.get('origin') in ["OEM", "Locally made", "Locally refurbished"] else 0)
+                
+                orig_val = spare_row.get('origin')
+                origin_list = ["OEM", "Locally made", "Locally refurbished"]
+                default_orig_idx = origin_list.index(orig_val) if orig_val in origin_list else 0
+                new_origin = st.selectbox("Origin", origin_list, index=default_orig_idx)
+                
                 new_vendor = st.text_input("Vendor Name", value=str(spare_row.get('vendor', '') if str(spare_row.get('vendor')) != 'nan' else ''))
                 
-                # Conditional fields based on spare type / details
+                # Conditional fields based on spare type
                 new_item_detail = spare_row.get('item_detail')
                 if spare_row.get('spare_type') == 'Seal':
                     new_item_detail = st.text_input("Item Detail / Category info", value=str(spare_row.get('item_detail', '') if str(spare_row.get('item_detail')) != 'nan' else ''))
