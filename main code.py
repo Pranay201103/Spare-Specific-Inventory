@@ -204,6 +204,45 @@ elif page == "Manage Inventory":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error registering equipment: {e}")
+            st.divider()
+
+        # Option B: Bulk Excel Upload
+        st.subheader("📁 Bulk Upload via Excel")
+        st.markdown("Your Excel file must contain columns named: **`eq_id`** and **`eq_type`**.")
+        
+        uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
+        
+        if uploaded_excel is not None:
+            try:
+                # Read the excel file using pandas
+                excel_df = pd.read_excel(uploaded_excel)
+                
+                # Clean column names (strip whitespace, lowercase to match easily)
+                excel_df.columns = [c.strip().lower() for c in excel_df.columns]
+                
+                if 'eq_id' not in excel_df.columns or 'eq_type' not in excel_df.columns:
+                    st.error("Excel file must contain columns named 'eq_id' and 'eq_type'.")
+                else:
+                    st.write("Preview of uploaded data:", excel_df.head())
+                    
+                    if st.button("Import All Equipment"):
+                        imported_count = 0
+                        with conn.session as s:
+                            for _, row in excel_df.iterrows():
+                                eq_id_val = str(row['eq_id']).upper().strip()
+                                eq_type_val = str(row['eq_type']).strip()
+                                
+                                if eq_id_val and eq_id_val != 'NAN':
+                                    s.execute(text("""
+                                        INSERT INTO equipment (eq_id, eq_type) VALUES (:eid, :etype)
+                                        ON CONFLICT (eq_id) DO NOTHING
+                                    """), {"eid": eq_id_val, "etype": eq_type_val})
+                                    imported_count += 1
+                            s.commit()
+                        st.success(f"Successfully processed and imported/updated {imported_count} equipment entries from Excel!")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Error reading Excel file: {e}")
     with tab3:
         st.subheader("Link an Existing Spare to Another Equipment")
         
