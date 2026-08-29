@@ -183,6 +183,74 @@ elif page == "Manage Inventory":
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error saving entry: {e}")
+                st.divider()
+        st.subheader("📁 Bulk Upload Spares via Excel")
+        st.markdown("Your Excel file should include columns like: **`spare_type`**, **`qty`**, **`storage_loc`**, **`origin`**, **`vendor`**, and **`linked_equipment`**.")
+        
+        uploaded_spare_excel = st.file_uploader("Upload Spares Excel File", type=["xlsx", "xls"], key="spare_excel_upload")
+        
+        if uploaded_spare_excel is not None:
+            try:
+                spare_excel_df = pd.read_excel(uploaded_spare_excel)
+                spare_excel_df.columns = [c.strip().lower() for c in spare_excel_df.columns]
+                
+                if 'spare_type' not in spare_excel_df.columns or 'qty' not in spare_excel_df.columns:
+                    st.error("Excel file must at least contain 'spare_type' and 'qty' columns.")
+                else:
+                    st.write("Preview of uploaded spares:", spare_excel_df.head())
+                    
+                    if st.button("Import All Spares"):
+                        imported_spares_count = 0
+                        
+                        # Fetch all registered equipment to match text IDs to database primary keys later
+                        eq_lookup_df = conn.query("SELECT id, eq_id FROM equipment", ttl=0)
+                        eq_map = {row['eq_id'].upper(): row['id'] for _, row in eq_lookup_df.iterrows()}
+                        
+                        with conn.session as s:
+                            for _, row in spare_excel_df.iterrows():
+                                spare_type_val = str(row.get('spare_type', 'Mechanical spares')).strip()
+                                qty_val = int(row.get('qty', 0)) if pd.notna(row.get('qty')) else 0
+                                loc_val = str(row.get('storage_loc', '')).strip() if pd.notna(row.get('storage_loc')) else None
+                                origin_val = str(row.get('origin', 'OEM')).strip() if pd.notna(row.get('origin')) else 'OEM'
+                                vendor_val = str(row.get('vendor', '')).strip() if pd.notna(row.get('vendor')) else None
+                                linked_eq_str = str(row.get('linked_equipment', '')).strip() if pd.notna(row.get('linked_equipment')) else ''
+                                
+                                # 1. Generate Unique Spare ID automatically (e.g. BEAR-001)
+                                count_res = s.execute(text("SELECT COUNT(*) FROM inventory")).fetchone()
+                                next_num = (count_res[0] if count_res else 0) + 1
+                                prefix = spare_type_val[:4].upper().replace(" ", "")
+                                generated_spare_id = f"{prefix}-{next_num:03d}"
+                                
+                                # 2. Insert into inventory table
+                                res = s.execute(text("""
+                                    INSERT INTO inventory (spare_id, spare_type, qty, storage_loc, origin, vendor) 
+                                    VALUES (:sid, :st, :qty, :loc, :ori, :ven)
+                                    RETURNING id
+                                """), {
+                                    "sid": generated_spare_id, "st": spare_type_val, "qty": qty_val, 
+                                    "loc": loc_val, "ori": origin_val, "ven": vendor_val
+                                })
+                                spare_pk_id = res.fetchone()[0]
+                                
+                                # 3. Handle Linking to Equipment (splitting by comma)
+                                if linked_eq_str and linked_eq_str.lower() != 'nan':
+                                    eq_ids_in_row = [e.strip().upper() for e in linked_eq_str.split(',')]
+                                    for eq_name in eq_ids_in_row:
+                                        if eq_name in eq_map:
+                                            eq_pk_id = eq_map[eq_name]
+                                            s.execute(text("""
+                                                INSERT INTO equipment_spares (equipment_id, spare_id) 
+                                                VALUES (:eq_id, :sp_id)
+                                                ON CONFLICT DO NOTHING
+                                            """), {"eq_id": eq_pk_id, "sp_id": spare_pk_id})
+                                            
+                                imported_spares_count += 1
+                                
+                            s.commit()
+                        st.success(f"Successfully imported {imported_spares_count} spare items with auto-generated IDs and links!")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Error reading or importing spare Excel file: {e}")
 
     with tab2:
         st.subheader("Register Machinery/Equipment First")
